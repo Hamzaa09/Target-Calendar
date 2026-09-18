@@ -3,7 +3,8 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 /**
  * TargetCalendar
  * A parallel-months calendar for tracking progress toward a single goal
- * across a chosen date range.
+ * across a chosen date range. Supports excluding specific weekdays
+ * (e.g. Saturdays & Sundays) from both marking and the progress stats.
  *
  * Requirements:
  *  - React 18+
@@ -17,9 +18,6 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
  *  global CSS file, right after `@import "tailwindcss";`:
  *
  *    @custom-variant dark (&:is(.dark *));
- *
- *  Without that line, every `dark:` utility class in this file will be
- *  inert no matter what the `theme` state is set to.
  *
  * Usage:
  *  <TargetCalendar />
@@ -93,6 +91,17 @@ const MARK_TYPES = [
   { id: "note", label: "Flagged / note", color: "#6B5C82", icon: Icon.Note },
 ];
 
+// Weekday labels/indices follow JS Date#getDay(): 0 = Sunday … 6 = Saturday
+const WEEKDAY_TOGGLES = [
+  { day: 0, short: "S", label: "Sunday" },
+  { day: 1, short: "M", label: "Monday" },
+  { day: 2, short: "T", label: "Tuesday" },
+  { day: 3, short: "W", label: "Wednesday" },
+  { day: 4, short: "T", label: "Thursday" },
+  { day: 5, short: "F", label: "Friday" },
+  { day: 6, short: "S", label: "Saturday" },
+];
+
 // ---------------------------------------------------------------------------
 // Date helpers (no external date library, to keep this dependency-free)
 // ---------------------------------------------------------------------------
@@ -138,6 +147,21 @@ function buildWeeks(year, month) {
   return weeks;
 }
 
+// Counts how many days between start/end (inclusive) aren't an excluded weekday
+function countCountableDays(start, end, excludedWeekdays) {
+  if (!start || !end) return 0;
+  let count = 0;
+  const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  let guard = 0;
+  while (cursor <= last && guard < 20000) {
+    if (!excludedWeekdays.includes(cursor.getDay())) count++;
+    cursor.setDate(cursor.getDate() + 1);
+    guard++;
+  }
+  return count;
+}
+
 // ---------------------------------------------------------------------------
 // localStorage persistence (safe no-ops if storage is unavailable, e.g.
 // private browsing, SSR, or a sandboxed iframe)
@@ -177,11 +201,10 @@ const DEFAULT_STATE = {
   startDate: toKey(todayNow.getFullYear(), todayNow.getMonth(), 1),
   endDate: toKey(todayNow.getFullYear(), todayNow.getMonth() + 2, 0),
   marks: {},
+  excludedWeekdays: [],
 };
 
 export default function TargetCalendar() {
-  // Loaded lazily (function form of useState) so localStorage is only read
-  // once, on the very first render, rather than on every re-render.
   const [saved] = useState(() => ({ ...DEFAULT_STATE, ...loadSavedState() }));
 
   const [theme, setTheme] = useState(saved.theme);
@@ -189,17 +212,16 @@ export default function TargetCalendar() {
   const [startDate, setStartDate] = useState(saved.startDate);
   const [endDate, setEndDate] = useState(saved.endDate);
   const [marks, setMarks] = useState(saved.marks); // { "2026-09-17": "achieved" }
+  const [excludedWeekdays, setExcludedWeekdays] = useState(saved.excludedWeekdays || []);
   const [activePen, setActivePen] = useState("achieved");
   const [history, setHistory] = useState([]); // stack of previous `marks` snapshots
   const [confirmingReset, setConfirmingReset] = useState(false);
 
   const isDark = theme === "dark";
 
-  // Persist whenever any saved field changes. Undo/redo history and the
-  // active pen are deliberately session-only, not written to storage.
   useEffect(() => {
-    saveState({ theme, title, startDate, endDate, marks });
-  }, [theme, title, startDate, endDate, marks]);
+    saveState({ theme, title, startDate, endDate, marks, excludedWeekdays });
+  }, [theme, title, startDate, endDate, marks, excludedWeekdays]);
 
   const rangeStart = useMemo(() => (startDate ? parseISO(startDate) : null), [startDate]);
   const rangeEnd = useMemo(() => (endDate ? parseISO(endDate) : null), [endDate]);
@@ -208,6 +230,7 @@ export default function TargetCalendar() {
 
   const months = useMemo(() => monthsBetween(startDate, endDate), [startDate, endDate]);
 
+  // Whether a day falls inside the chosen date range at all
   const inRange = useCallback(
     (y, m, d) => {
       if (!orderedStart || !orderedEnd) return false;
@@ -217,8 +240,16 @@ export default function TargetCalendar() {
     [orderedStart, orderedEnd]
   );
 
-  // Applies a new marks object while pushing the previous one onto the undo
-  // stack, using functional updates so it's always working off latest state.
+  // Whether a day should actually count: in range AND not an excluded weekday
+  const isCountable = useCallback(
+    (y, m, d) => {
+      if (!inRange(y, m, d)) return false;
+      const weekday = new Date(y, m, d).getDay();
+      return !excludedWeekdays.includes(weekday);
+    },
+    [inRange, excludedWeekdays]
+  );
+
   const applyMarks = useCallback((nextMarks) => {
     setMarks((prev) => {
       setHistory((h) => [...h, prev]);
@@ -226,8 +257,8 @@ export default function TargetCalendar() {
     });
   }, []);
 
-  const handleDayClick = (key, within) => {
-    if (!within) return;
+  const handleDayClick = (key, countable) => {
+    if (!countable) return;
     setMarks((prev) => {
       const next = { ...prev };
       if (next[key] === activePen) {
@@ -258,31 +289,26 @@ export default function TargetCalendar() {
     setConfirmingReset(false);
   };
 
+  const toggleExcludedWeekday = (day) => {
+    setExcludedWeekdays((prev) =>
+      prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day]
+    );
+  };
+
   const stats = useMemo(() => {
     const counts = { achieved: 0, partial: 0, missed: 0, note: 0 };
-    let totalDays = 0;
-    if (orderedStart && orderedEnd) {
-      totalDays = Math.round((orderedEnd - orderedStart) / 86400000) + 1;
-    }
-    Object.values(marks).forEach((v) => {
-      if (counts[v] !== undefined) counts[v]++;
+    const totalDays = countCountableDays(orderedStart, orderedEnd, excludedWeekdays);
+
+    Object.entries(marks).forEach(([key, value]) => {
+      const d = parseISO(key);
+      if (!isCountable(d.getFullYear(), d.getMonth(), d.getDate())) return;
+      if (counts[value] !== undefined) counts[value]++;
     });
+
     const pct = totalDays > 0 ? Math.round((counts.achieved / totalDays) * 100) : 0;
     return { counts, totalDays, pct };
-  }, [marks, orderedStart, orderedEnd]);
+  }, [marks, orderedStart, orderedEnd, excludedWeekdays, isCountable]);
 
-  // ---------------------------------------------------------------------
-  // NOTE ON THE FIX BELOW:
-  // Previously the `dark` toggle class and the `dark:*` utility classes
-  // both lived on this same root div. Tailwind's class-based dark mode
-  // variant compiles to a *descendant* selector (`.dark .dark\:bg-...` in
-  // v3, or `:is(.dark *)` in v4), which never matches an element carrying
-  // both classes on itself. That's why toggling `theme` had no visible
-  // effect on this container's own background/text color.
-  //
-  // The fix: put `dark` on an outer wrapper, and keep all `dark:` utility
-  // classes on a child element (or elements) nested inside it.
-  // ---------------------------------------------------------------------
   return (
     <div className={isDark ? "dark" : ""}>
       <div
@@ -313,7 +339,7 @@ export default function TargetCalendar() {
               />
               <p className="mt-2 text-sm text-[#1F2421]/60 dark:text-[#ECEAE3]/60">
                 {fmtDisplay(startDate)} &nbsp;→&nbsp; {fmtDisplay(endDate)}
-                {stats.totalDays > 0 && <span> · {stats.totalDays} days</span>}
+                {stats.totalDays > 0 && <span> · {stats.totalDays} counted days</span>}
               </p>
             </div>
 
@@ -431,6 +457,35 @@ export default function TargetCalendar() {
                 Click a day to apply · click the same mark again to clear it
               </span>
             </div>
+
+            {/* ---------------- Excluded weekdays ---------------- */}
+            <div className="flex flex-wrap items-center gap-2 border-t border-[#1F2421]/8 dark:border-[#ECEAE3]/10 pt-5">
+              <span className="text-xs text-[#1F2421]/50 dark:text-[#ECEAE3]/50 mr-1">
+                Exclude from count
+              </span>
+              {WEEKDAY_TOGGLES.map(({ day, short, label }) => {
+                const excluded = excludedWeekdays.includes(day);
+                return (
+                  <button
+                    key={day}
+                    onClick={() => toggleExcludedWeekday(day)}
+                    aria-pressed={excluded}
+                    title={label}
+                    className={
+                      "h-7 w-7 rounded-full text-xs font-medium border transition-all " +
+                      (excluded
+                        ? "bg-[#AD4B3B] border-transparent text-white"
+                        : "text-[#1F2421]/70 dark:text-[#ECEAE3]/70 border-[#1F2421]/15 dark:border-[#ECEAE3]/15 hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10")
+                    }
+                  >
+                    {short}
+                  </button>
+                );
+              })}
+              <span className="text-[11px] text-[#1F2421]/40 dark:text-[#ECEAE3]/40 ml-1">
+                Excluded weekdays are dimmed and skipped in stats
+              </span>
+            </div>
           </div>
 
           {/* ---------------- Months grid ---------------- */}
@@ -446,7 +501,7 @@ export default function TargetCalendar() {
                   year={year}
                   month={month}
                   marks={marks}
-                  inRange={inRange}
+                  isCountable={isCountable}
                   onDayClick={handleDayClick}
                 />
               ))}
@@ -469,7 +524,7 @@ export default function TargetCalendar() {
 // ---------------------------------------------------------------------------
 // One month's grid
 // ---------------------------------------------------------------------------
-function MonthCard({ year, month, marks, inRange, onDayClick }) {
+function MonthCard({ year, month, marks, isCountable, onDayClick }) {
   const weeks = useMemo(() => buildWeeks(year, month), [year, month]);
   const markLookup = useMemo(
     () => Object.fromEntries(MARK_TYPES.map((m) => [m.id, m])),
@@ -500,7 +555,7 @@ function MonthCard({ year, month, marks, inRange, onDayClick }) {
         {weeks.flat().map((d, i) => {
           if (d === null) return <div key={i} />;
           const key = toKey(year, month, d);
-          const within = inRange(year, month, d);
+          const countable = isCountable(year, month, d);
           const mark = marks[key];
           const markCfg = mark ? markLookup[mark] : null;
           const MarkIcon = markCfg ? markCfg.icon : null;
@@ -508,11 +563,12 @@ function MonthCard({ year, month, marks, inRange, onDayClick }) {
           return (
             <button
               key={i}
-              onClick={() => onDayClick(key, within)}
-              disabled={!within}
+              onClick={() => onDayClick(key, countable)}
+              disabled={!countable}
+              title={!countable ? "Excluded from count" : undefined}
               className={
                 "aspect-square rounded-lg flex flex-col items-center justify-center gap-0.5 text-[13px] transition-colors " +
-                (within
+                (countable
                   ? "hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10 cursor-pointer"
                   : "opacity-25 cursor-default")
               }
