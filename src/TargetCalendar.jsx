@@ -517,7 +517,7 @@ export default function TargetCalendar() {
                       value={t.name}
                       onChange={(e) => renameTarget(t.id, e.target.value)}
                       placeholder="Target name"
-                      className="min-w-[110px] flex-1 bg-transparent text-sm
+                      className="min-w-27.5 flex-1 bg-transparent text-sm
                                  border-b border-transparent focus:border-[#1F2421]/30 dark:focus:border-[#ECEAE3]/30
                                  focus:outline-none px-1 py-0.5"
                     />
