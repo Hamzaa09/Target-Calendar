@@ -2,9 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 
 /**
  * TargetCalendar
- * A parallel-months calendar for tracking progress toward a single goal
- * across a chosen date range. Supports excluding specific weekdays
- * (e.g. Saturdays & Sundays) from both marking and the progress stats.
+ * A parallel-months calendar for tracking 1–4 targets over a single date
+ * range, where each target has its own day-of-week schedule
+ * (e.g. "Strength training" on Mon/Wed/Fri, "Reading" on Tue/Thu/Sat,
+ * "Rest & review" on Sunday — all inside the same 80-day window).
  *
  * Requirements:
  *  - React 18+
@@ -58,38 +59,21 @@ const Icon = {
       <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4.5 4.5L19 7" />
     </svg>
   ),
-  Half: (p) => (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" {...p}>
-      <path strokeLinecap="round" d="M5 12h14" />
-    </svg>
-  ),
   Cross: (p) => (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" {...p}>
       <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
     </svg>
   ),
-  Note: (p) => (
-    <svg viewBox="0 0 24 24" fill="currentColor" {...p}>
-      <circle cx="12" cy="12" r="4.5" />
-    </svg>
-  ),
-  Eraser: (p) => (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" {...p}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M17 21H8l-5-5 9.5-9.5a2 2 0 0 1 2.8 0l4.2 4.2a2 2 0 0 1 0 2.8L13 20" />
-      <path strokeLinecap="round" d="M10 13l4 4" />
-    </svg>
-  ),
 };
 
 // ---------------------------------------------------------------------------
-// Mark-type registry: edit this list to change what a "pen" can place on a day
+// Target palette: each target added to a period gets the next unused color.
+// Capped at 4 targets both for legibility on a single day cell and because
+// the palette below has exactly four distinct, accessible colors.
 // ---------------------------------------------------------------------------
-const MARK_TYPES = [
-  { id: "achieved", label: "Hit the target", color: "#3F6B5E", icon: Icon.Check },
-  { id: "partial", label: "Partial progress", color: "#C98A3E", icon: Icon.Half },
-  { id: "missed", label: "Missed", color: "#AD4B3B", icon: Icon.Cross },
-  { id: "note", label: "Flagged / note", color: "#6B5C82", icon: Icon.Note },
-];
+const PALETTE = ["#3F6B5E", "#C98A3E", "#AD4B3B", "#6B5C82"];
+const MAX_TARGETS = PALETTE.length;
+const DOT = 11; // px, size of each per-target marker inside a day cell
 
 // Weekday labels/indices follow JS Date#getDay(): 0 = Sunday … 6 = Saturday
 const WEEKDAY_TOGGLES = [
@@ -147,15 +131,17 @@ function buildWeeks(year, month) {
   return weeks;
 }
 
-// Counts how many days between start/end (inclusive) aren't an excluded weekday
-function countCountableDays(start, end, excludedWeekdays) {
-  if (!start || !end) return 0;
+// Counts how many dates between start/end (inclusive) fall on one of
+// `weekdaysAllowed` and are NOT in `excludedWeekdays` (global blackout days).
+function countScheduledDays(start, end, weekdaysAllowed, excludedWeekdays) {
+  if (!start || !end || !weekdaysAllowed || weekdaysAllowed.length === 0) return 0;
   let count = 0;
   const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
   const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
   let guard = 0;
   while (cursor <= last && guard < 20000) {
-    if (!excludedWeekdays.includes(cursor.getDay())) count++;
+    const wd = cursor.getDay();
+    if (weekdaysAllowed.includes(wd) && !excludedWeekdays.includes(wd)) count++;
     cursor.setDate(cursor.getDate() + 1);
     guard++;
   }
@@ -166,7 +152,7 @@ function countCountableDays(start, end, excludedWeekdays) {
 // localStorage persistence (safe no-ops if storage is unavailable, e.g.
 // private browsing, SSR, or a sandboxed iframe)
 // ---------------------------------------------------------------------------
-const STORAGE_KEY = "target-calendar:v1";
+const STORAGE_KEY = "target-calendar:v2"; // bumped: v1 marks were single-goal, v2 are per-target
 
 function loadSavedState() {
   try {
@@ -191,6 +177,14 @@ const fmtDisplay = (iso) => {
   return `${MONTH_NAMES[d.getMonth()].slice(0, 3)} ${d.getDate()}, ${d.getFullYear()}`;
 };
 
+// Mark keys combine a target id and a date so all statuses live in one
+// flat, easily-undoable object: { "t1__2026-09-17": "done" }
+const markKey = (targetId, dateKey) => `${targetId}__${dateKey}`;
+const splitMarkKey = (key) => {
+  const i = key.indexOf("__");
+  return [key.slice(0, i), key.slice(i + 2)];
+};
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -202,6 +196,7 @@ const DEFAULT_STATE = {
   endDate: toKey(todayNow.getFullYear(), todayNow.getMonth() + 2, 0),
   marks: {},
   excludedWeekdays: [],
+  targets: [{ id: "t1", name: "Target 1", color: PALETTE[0], weekdays: [0, 1, 2, 3, 4, 5, 6] }],
 };
 
 export default function TargetCalendar() {
@@ -211,17 +206,19 @@ export default function TargetCalendar() {
   const [title, setTitle] = useState(saved.title);
   const [startDate, setStartDate] = useState(saved.startDate);
   const [endDate, setEndDate] = useState(saved.endDate);
-  const [marks, setMarks] = useState(saved.marks); // { "2026-09-17": "achieved" }
+  const [marks, setMarks] = useState(saved.marks); // { "t1__2026-09-17": "done" | "missed" }
   const [excludedWeekdays, setExcludedWeekdays] = useState(saved.excludedWeekdays || []);
-  const [activePen, setActivePen] = useState("achieved");
+  const [targets, setTargets] = useState(
+    saved.targets && saved.targets.length ? saved.targets : DEFAULT_STATE.targets
+  );
   const [history, setHistory] = useState([]); // stack of previous `marks` snapshots
   const [confirmingReset, setConfirmingReset] = useState(false);
 
   const isDark = theme === "dark";
 
   useEffect(() => {
-    saveState({ theme, title, startDate, endDate, marks, excludedWeekdays });
-  }, [theme, title, startDate, endDate, marks, excludedWeekdays]);
+    saveState({ theme, title, startDate, endDate, marks, excludedWeekdays, targets });
+  }, [theme, title, startDate, endDate, marks, excludedWeekdays, targets]);
 
   const rangeStart = useMemo(() => (startDate ? parseISO(startDate) : null), [startDate]);
   const rangeEnd = useMemo(() => (endDate ? parseISO(endDate) : null), [endDate]);
@@ -240,12 +237,14 @@ export default function TargetCalendar() {
     [orderedStart, orderedEnd]
   );
 
-  // Whether a day should actually count: in range AND not an excluded weekday
-  const isCountable = useCallback(
-    (y, m, d) => {
+  // Whether a given target is actually scheduled (and trackable) on this day:
+  // in range, not a globally-excluded weekday, and on that target's weekdays.
+  const isTargetCountable = useCallback(
+    (target, y, m, d) => {
       if (!inRange(y, m, d)) return false;
-      const weekday = new Date(y, m, d).getDay();
-      return !excludedWeekdays.includes(weekday);
+      const wd = new Date(y, m, d).getDay();
+      if (excludedWeekdays.includes(wd)) return false;
+      return target.weekdays.includes(wd);
     },
     [inRange, excludedWeekdays]
   );
@@ -257,15 +256,16 @@ export default function TargetCalendar() {
     });
   }, []);
 
-  const handleDayClick = (key, countable) => {
-    if (!countable) return;
+  // Cycles a single (target, day) cell: unmarked → done → missed → unmarked
+  const handleDayClick = (targetId, dateKey, applicable) => {
+    if (!applicable) return;
+    const key = markKey(targetId, dateKey);
     setMarks((prev) => {
       const next = { ...prev };
-      if (next[key] === activePen) {
-        delete next[key]; // clicking the same active mark again clears it
-      } else {
-        next[key] = activePen;
-      }
+      const current = next[key];
+      if (!current) next[key] = "done";
+      else if (current === "done") next[key] = "missed";
+      else delete next[key];
       setHistory((h) => [...h, prev]);
       return next;
     });
@@ -295,19 +295,62 @@ export default function TargetCalendar() {
     );
   };
 
-  const stats = useMemo(() => {
-    const counts = { achieved: 0, partial: 0, missed: 0, note: 0 };
-    const totalDays = countCountableDays(orderedStart, orderedEnd, excludedWeekdays);
-
-    Object.entries(marks).forEach(([key, value]) => {
-      const d = parseISO(key);
-      if (!isCountable(d.getFullYear(), d.getMonth(), d.getDate())) return;
-      if (counts[value] !== undefined) counts[value]++;
+  const addTarget = () => {
+    setTargets((prev) => {
+      if (prev.length >= MAX_TARGETS) return prev;
+      const color = PALETTE[prev.length % PALETTE.length];
+      return [...prev, { id: `t${Date.now()}`, name: `Target ${prev.length + 1}`, color, weekdays: [] }];
     });
+  };
 
-    const pct = totalDays > 0 ? Math.round((counts.achieved / totalDays) * 100) : 0;
-    return { counts, totalDays, pct };
-  }, [marks, orderedStart, orderedEnd, excludedWeekdays, isCountable]);
+  const removeTarget = (id) => {
+    setTargets((prev) => (prev.length <= 1 ? prev : prev.filter((t) => t.id !== id)));
+  };
+
+  const renameTarget = (id, name) => {
+    setTargets((prev) => prev.map((t) => (t.id === id ? { ...t, name } : t)));
+  };
+
+  const toggleTargetWeekday = (id, day) => {
+    setTargets((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? { ...t, weekdays: t.weekdays.includes(day) ? t.weekdays.filter((d) => d !== day) : [...t.weekdays, day] }
+          : t
+      )
+    );
+  };
+
+  // Per-target totals (scheduled / done / %), then an overall combined figure
+  const targetStats = useMemo(() => {
+    const result = {};
+    targets.forEach((t) => {
+      const total = countScheduledDays(orderedStart, orderedEnd, t.weekdays, excludedWeekdays);
+      let done = 0;
+      Object.entries(marks).forEach(([key, status]) => {
+        if (status !== "done") return;
+        const [tid, dateKey] = splitMarkKey(key);
+        if (tid !== t.id) return;
+        const d = parseISO(dateKey);
+        if (isTargetCountable(t, d.getFullYear(), d.getMonth(), d.getDate())) done++;
+      });
+      result[t.id] = { total, done, pct: total > 0 ? Math.round((done / total) * 100) : 0 };
+    });
+    return result;
+  }, [targets, marks, orderedStart, orderedEnd, excludedWeekdays, isTargetCountable]);
+
+  const overall = useMemo(() => {
+    let total = 0;
+    let done = 0;
+    targets.forEach((t) => {
+      const s = targetStats[t.id];
+      if (s) {
+        total += s.total;
+        done += s.done;
+      }
+    });
+    return { total, done, pct: total > 0 ? Math.round((done / total) * 100) : 0 };
+  }, [targets, targetStats]);
 
   return (
     <div className={isDark ? "dark" : ""}>
@@ -339,7 +382,7 @@ export default function TargetCalendar() {
               />
               <p className="mt-2 text-sm text-[#1F2421]/60 dark:text-[#ECEAE3]/60">
                 {fmtDisplay(startDate)} &nbsp;→&nbsp; {fmtDisplay(endDate)}
-                {stats.totalDays > 0 && <span> · {stats.totalDays} counted days</span>}
+                {overall.total > 0 && <span> · {overall.total} scheduled instances</span>}
               </p>
             </div>
 
@@ -354,21 +397,37 @@ export default function TargetCalendar() {
             </button>
           </header>
 
-          {/* ---------------- Progress bar ---------------- */}
-          {stats.totalDays > 0 && (
-            <div className="mb-8">
-              <div className="h-1.5 w-full rounded-full bg-[#1F2421]/8 dark:bg-[#ECEAE3]/10 overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-500"
-                  style={{ width: `${stats.pct}%`, backgroundColor: "#3F6B5E" }}
-                />
+          {/* ---------------- Progress: overall bar + per-target chips ---------------- */}
+          {overall.total > 0 && (
+            <div className="mb-8 space-y-3">
+              <div>
+                <div className="h-1.5 w-full rounded-full bg-[#1F2421]/8 dark:bg-[#ECEAE3]/10 overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-500"
+                    style={{ width: `${overall.pct}%`, backgroundColor: "#3F6B5E" }}
+                  />
+                </div>
+                <p className="mt-2 text-xs text-[#1F2421]/55 dark:text-[#ECEAE3]/55">
+                  {overall.pct}% overall · {overall.done}/{overall.total} scheduled days completed
+                </p>
               </div>
-              <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-[#1F2421]/55 dark:text-[#ECEAE3]/55">
-                <span>{stats.pct}% of days hit</span>
-                <span>{stats.counts.achieved} achieved</span>
-                <span>{stats.counts.partial} partial</span>
-                <span>{stats.counts.missed} missed</span>
-                {stats.counts.note > 0 && <span>{stats.counts.note} flagged</span>}
+
+              <div className="flex flex-wrap gap-2">
+                {targets.map((t) => {
+                  const s = targetStats[t.id] || { total: 0, done: 0, pct: 0 };
+                  return (
+                    <div
+                      key={t.id}
+                      className="flex items-center gap-2 rounded-full border border-[#1F2421]/10 dark:border-[#ECEAE3]/10 px-3 py-1.5 text-xs"
+                    >
+                      <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ backgroundColor: t.color }} />
+                      <span className="font-medium">{t.name || "Untitled"}</span>
+                      <span className="text-[#1F2421]/45 dark:text-[#ECEAE3]/45">
+                        {s.done}/{s.total} · {s.pct}%
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -376,7 +435,7 @@ export default function TargetCalendar() {
           {/* ---------------- Toolbar ---------------- */}
           <div
             className="mb-9 rounded-2xl border border-[#1F2421]/10 dark:border-[#ECEAE3]/10
-                       bg-white/60 dark:bg-[#1B2124] p-4 sm:p-5 flex flex-col gap-4"
+                       bg-white/60 dark:bg-[#1B2124] p-4 sm:p-5 flex flex-col gap-5"
           >
             <div className="flex flex-wrap items-end gap-4">
               <label className="flex flex-col gap-1 text-xs text-[#1F2421]/55 dark:text-[#ECEAE3]/55">
@@ -430,38 +489,81 @@ export default function TargetCalendar() {
               </div>
             </div>
 
-            {/* ---------------- Pen / mark-type selector ---------------- */}
-            <div className="flex flex-wrap items-center gap-2 border-t border-[#1F2421]/8 dark:border-[#ECEAE3]/10 pt-5">
-              <span className="text-xs text-[#1F2421]/50 dark:text-[#ECEAE3]/50 mr-1">Mark days as</span>
-              {MARK_TYPES.map((m) => {
-                const Ico = m.icon;
-                const active = activePen === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => setActivePen(m.id)}
-                    className={
-                      "flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium border transition-all " +
-                      (active
-                        ? "text-white border-transparent shadow-sm"
-                        : "text-[#1F2421]/70 dark:text-[#ECEAE3]/70 border-[#1F2421]/15 dark:border-[#ECEAE3]/15 hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10")
-                    }
-                    style={active ? { backgroundColor: m.color } : undefined}
+            {/* ---------------- Targets editor ---------------- */}
+            <div className="flex flex-col gap-3 border-t border-[#1F2421]/8 dark:border-[#ECEAE3]/10 pt-5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[#1F2421]/50 dark:text-[#ECEAE3]/50">
+                  Targets in this period — give each its own days of the week
+                </span>
+                <button
+                  onClick={addTarget}
+                  disabled={targets.length >= MAX_TARGETS}
+                  className="text-xs font-medium rounded-full border border-[#1F2421]/15 dark:border-[#ECEAE3]/15
+                             px-3 py-1 hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10
+                             disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  + Add target
+                </button>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                {targets.map((t) => (
+                  <div
+                    key={t.id}
+                    className="flex flex-wrap items-center gap-2 rounded-xl border border-[#1F2421]/10 dark:border-[#ECEAE3]/10 p-2.5"
                   >
-                    <Ico className="h-3 w-3" />
-                    {m.label}
-                  </button>
-                );
-              })}
-              <span className="text-[11px] text-[#1F2421]/40 dark:text-[#ECEAE3]/40 ml-1">
-                Click a day to apply · click the same mark again to clear it
-              </span>
+                    <span className="h-3 w-3 rounded-full shrink-0" style={{ backgroundColor: t.color }} />
+                    <input
+                      value={t.name}
+                      onChange={(e) => renameTarget(t.id, e.target.value)}
+                      placeholder="Target name"
+                      className="min-w-[110px] flex-1 bg-transparent text-sm
+                                 border-b border-transparent focus:border-[#1F2421]/30 dark:focus:border-[#ECEAE3]/30
+                                 focus:outline-none px-1 py-0.5"
+                    />
+                    <div className="flex items-center gap-1">
+                      {WEEKDAY_TOGGLES.map(({ day, short, label }) => {
+                        const on = t.weekdays.includes(day);
+                        return (
+                          <button
+                            key={day}
+                            title={label}
+                            onClick={() => toggleTargetWeekday(t.id, day)}
+                            aria-pressed={on}
+                            style={on ? { backgroundColor: t.color, borderColor: "transparent", color: "#fff" } : undefined}
+                            className={
+                              "h-6 w-6 rounded-full text-[11px] font-medium border transition-colors " +
+                              (on
+                                ? ""
+                                : "text-[#1F2421]/70 dark:text-[#ECEAE3]/70 border-[#1F2421]/15 dark:border-[#ECEAE3]/15 hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10")
+                            }
+                          >
+                            {short}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <button
+                      onClick={() => removeTarget(t.id)}
+                      disabled={targets.length <= 1}
+                      className="ml-auto text-xs text-[#1F2421]/40 dark:text-[#ECEAE3]/40 hover:text-[#AD4B3B]
+                                 disabled:opacity-20 disabled:hover:text-[#1F2421]/40 dark:disabled:hover:text-[#ECEAE3]/40
+                                 px-2 transition-colors"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-[#1F2421]/40 dark:text-[#ECEAE3]/40">
+                Click a target's dot on a scheduled day to cycle it: empty → done → missed → empty.
+              </p>
             </div>
 
             {/* ---------------- Excluded weekdays ---------------- */}
             <div className="flex flex-wrap items-center gap-2 border-t border-[#1F2421]/8 dark:border-[#ECEAE3]/10 pt-5">
               <span className="text-xs text-[#1F2421]/50 dark:text-[#ECEAE3]/50 mr-1">
-                Exclude from count
+                Exclude from count (all targets)
               </span>
               {WEEKDAY_TOGGLES.map(({ day, short, label }) => {
                 const excluded = excludedWeekdays.includes(day);
@@ -483,7 +585,7 @@ export default function TargetCalendar() {
                 );
               })}
               <span className="text-[11px] text-[#1F2421]/40 dark:text-[#ECEAE3]/40 ml-1">
-                Excluded weekdays are dimmed and skipped in stats
+                e.g. blackout dates that apply to every target at once
               </span>
             </div>
           </div>
@@ -500,8 +602,10 @@ export default function TargetCalendar() {
                   key={`${year}-${month}`}
                   year={year}
                   month={month}
+                  targets={targets}
                   marks={marks}
-                  isCountable={isCountable}
+                  inRange={inRange}
+                  isTargetCountable={isTargetCountable}
                   onDayClick={handleDayClick}
                 />
               ))}
@@ -524,12 +628,8 @@ export default function TargetCalendar() {
 // ---------------------------------------------------------------------------
 // One month's grid
 // ---------------------------------------------------------------------------
-function MonthCard({ year, month, marks, isCountable, onDayClick }) {
+function MonthCard({ year, month, targets, marks, inRange, isTargetCountable, onDayClick }) {
   const weeks = useMemo(() => buildWeeks(year, month), [year, month]);
-  const markLookup = useMemo(
-    () => Object.fromEntries(MARK_TYPES.map((m) => [m.id, m])),
-    []
-  );
 
   return (
     <div
@@ -555,36 +655,49 @@ function MonthCard({ year, month, marks, isCountable, onDayClick }) {
         {weeks.flat().map((d, i) => {
           if (d === null) return <div key={i} />;
           const key = toKey(year, month, d);
-          const countable = isCountable(year, month, d);
-          const mark = marks[key];
-          const markCfg = mark ? markLookup[mark] : null;
-          const MarkIcon = markCfg ? markCfg.icon : null;
+          const dayInRange = inRange(year, month, d);
 
           return (
-            <button
+            <div
               key={i}
-              onClick={() => onDayClick(key, countable)}
-              disabled={!countable}
-              title={!countable ? "Excluded from count" : undefined}
               className={
-                "aspect-square rounded-lg flex flex-col items-center justify-center gap-0.5 text-[13px] transition-colors " +
-                (countable
-                  ? "hover:bg-[#1F2421]/5 dark:hover:bg-[#ECEAE3]/10 cursor-pointer"
-                  : "opacity-25 cursor-default")
+                "aspect-square rounded-lg flex flex-col items-center justify-center gap-1 text-[13px] " +
+                (dayInRange ? "" : "opacity-25")
               }
             >
               <span className="leading-none text-[#1F2421]/70 dark:text-[#ECEAE3]/70">{d}</span>
-              {MarkIcon ? (
-                <span
-                  className="h-4 w-4 rounded-full flex items-center justify-center text-white"
-                  style={{ backgroundColor: markCfg.color }}
-                >
-                  <MarkIcon className="h-2.5 w-2.5" />
-                </span>
-              ) : (
-                <span className="h-4 w-4" />
-              )}
-            </button>
+
+              <div className="flex items-center justify-center gap-1 flex-wrap" style={{ minHeight: DOT }}>
+                {targets.map((t) => {
+                  const applicable = isTargetCountable(t, year, month, d);
+                  if (!applicable) {
+                    return <span key={t.id} style={{ width: DOT, height: DOT }} className="inline-block" />;
+                  }
+                  const status = marks[markKey(t.id, key)];
+                  return (
+                    <button
+                      key={t.id}
+                      onClick={() => onDayClick(t.id, key, true)}
+                      title={t.name}
+                      style={{
+                        width: DOT,
+                        height: DOT,
+                        backgroundColor: status === "done" ? t.color : "transparent",
+                        borderColor: t.color,
+                        borderWidth: status === "done" ? 0 : 1.4,
+                        borderStyle: "solid",
+                      }}
+                      className="rounded-full flex items-center justify-center shrink-0 transition-colors hover:cursor-pointer"
+                    >
+                      {status === "done" && <Icon.Check className="h-1.5 w-1.5 text-white" strokeWidth="3.2" />}
+                      {status === "missed" && (
+                        <Icon.Cross className="h-1.5 w-1.5" style={{ color: t.color }} strokeWidth="3.2" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           );
         })}
       </div>
